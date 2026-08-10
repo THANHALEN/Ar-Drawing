@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AR Drawing V5 — Hướng dẫn lấy APK</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:700px;margin:0 auto;padding:20px;background:#f8f9fa;color:#212529}
+  h1{background:#1565C0;color:white;padding:20px;border-radius:12px;text-align:center}
+  .step{background:white;border-radius:10px;padding:20px;margin:16px 0;
+        box-shadow:0 2px 8px rgba(0,0,0,.1);border-left:5px solid #1565C0}
+  .step h2{color:#1565C0;margin-top:0}
+  .num{background:#1565C0;color:white;border-radius:50%;width:32px;height:32px;
+       display:inline-flex;align-items:center;justify-content:center;
+       font-weight:bold;margin-right:10px}
+  code{background:#e8f0fe;padding:2px 6px;border-radius:4px;font-family:monospace}
+  .tip{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin-top:10px}
+  .warn{background:#fff3e0;border:1px solid #ff9800;border-radius:8px;padding:12px;margin-top:10px}
+  a{color:#1565C0}
+  .feature{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+  .feat{background:#e8f0fe;padding:10px;border-radius:8px;font-size:14px}
+</style>
+</head>
+<body>
+<h1>📱 AR Drawing V5<br><small style="font-size:0.6em">Hướng dẫn lấy APK không cần Android Studio</small></h1>
+
+<div class="step">
+  <h2><span class="num">1</span>Tạo tài khoản GitHub miễn phí</h2>
+  <p>Vào <a href="https://github.com" target="_blank">github.com</a> → <strong>Sign up</strong></p>
+  <p>Điền: email, mật khẩu, username → Xác nhận email là xong.</p>
+</div>
+
+<div class="step">
+  <h2><span class="num">2</span>Tạo repository mới</h2>
+  <ol>
+    <li>Nhấn nút <code>+</code> góc trên phải → <strong>New repository</strong></li>
+    <li>Repository name: <code>ar-drawing</code></li>
+    <li>Chọn <strong>Public</strong></li>
+    <li>Nhấn <strong>Create repository</strong></li>
+  </ol>
+</div>
+
+<div class="step">
+  <h2><span class="num">3</span>Upload toàn bộ file project</h2>
+  <ol>
+    <li>Trên trang repository mới → tìm link <strong>"uploading an existing file"</strong></li>
+    <li>Mở thư mục <code>ardrawing_v5</code> trên máy tính</li>
+    <li><strong>Chọn tất cả</strong> (Ctrl+A hoặc Cmd+A) → <strong>kéo thả</strong> vào trình duyệt</li>
+    <li>Chờ upload xong → Cuộn xuống → nhấn <strong>Commit changes</strong></li>
+  </ol>
+  <div class="warn">⚠️ Quan trọng: phải upload CẢ thư mục con (.github, app, gradle, ...) — không chỉ file lẻ!</div>
+</div>
+
+<div class="step">
+  <h2><span class="num">4</span>Chờ GitHub tự động build (~5 phút)</h2>
+  <ol>
+    <li>Vào tab <strong>Actions</strong> trên trang GitHub</li>
+    <li>Thấy workflow <strong>"🏗️ Build AR Drawing APK"</strong> đang chạy</li>
+    <li>Chờ biểu tượng chuyển từ ⚙️ sang ✅</li>
+  </ol>
+  <div class="tip">💡 Nếu không thấy workflow tự chạy: Nhấn Actions → "Build AR Drawing APK" → nút <strong>"Run workflow"</strong> màu xanh</div>
+</div>
+
+<div class="step">
+  <h2><span class="num">5</span>Tải APK về điện thoại</h2>
+  <ol>
+    <li>Nhấn vào workflow run đã hoàn thành ✅</li>
+    <li>Cuộn xuống mục <strong>Artifacts</strong></li>
+    <li>Nhấn <strong>ARDrawing-V5-debug-apk</strong> → tải file ZIP</li>
+    <li>Giải nén → lấy file <code>app-debug.apk</code></li>
+    <li>Chuyển file sang điện thoại → Cài đặt</li>
+  </ol>
+</div>
+
+<div class="step">
+  <h2>📲 Cài APK lên Android</h2>
+  <p><strong>Bật cài từ nguồn không rõ:</strong><br>
+  Cài đặt → Ứng dụng → (tìm trình duyệt/Files bạn dùng) → Cho phép cài ứng dụng</p>
+  <p>Hoặc: Cài đặt → Bảo mật → Cài từ nguồn không rõ → Bật</p>
+</div>
+
+<div class="step">
+  <h2>✨ Tính năng app</h2>
+  <div class="feature">
+    <div class="feat">📷 Camera live real-time</div>
+    <div class="feat">🖼️ Chọn ảnh → auto Line Art</div>
+    <div class="feat">👆 Pinch zoom · xoay · kéo</div>
+    <div class="feat">🔒 Khóa ảnh khi vẽ</div>
+    <div class="feat">💡 Đèn flash</div>
+    <div class="feat">🔄 Reset vị trí</div>
+  </div>
+</div>
+
+</body>
+</html>
