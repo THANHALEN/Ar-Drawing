@@ -16,6 +16,16 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ArDrawing">
 
+        <!--
+            V9: ML Kit Selfie Segmentation model bundling.
+            "segmentation_selfie" → Android tải model lúc cài app (không cần internet sau đó).
+            Kích thước model: ~11MB — sẽ thêm vào APK size.
+            Nếu muốn giảm APK size: xóa meta-data này → model tải lúc dùng lần đầu (cần internet 1 lần).
+        -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="segmentation_selfie" />
+
         <activity
             android:name=".ui.MainActivity"
             android:exported="true"
