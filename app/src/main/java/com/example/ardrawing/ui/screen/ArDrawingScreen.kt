@@ -40,9 +40,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.RestartAlt
@@ -90,6 +92,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ardrawing.ui.TransformState
 import com.example.ardrawing.viewmodel.ArDrawingViewModel
+import com.example.ardrawing.viewmodel.DisplayMode
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
@@ -109,26 +112,21 @@ fun ArDrawingScreen(
     val uiState       by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarState = remember { SnackbarHostState() }
 
-    // Chỉ xin CAMERA — PickVisualMedia tự cấp URI permission cho từng ảnh
     val cameraPermission = rememberPermissionState(Manifest.permission.CAMERA)
 
-    // V5 fix: phân biệt chưa từng xin vs permanently denied
     var hasEverRequestedCamera by rememberSaveable { mutableStateOf(false) }
     val isPermanentlyDenied = hasEverRequestedCamera &&
         !cameraPermission.status.isGranted &&
         !cameraPermission.status.shouldShowRationale
 
-    // Image Picker
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         uri?.let { viewModel.loadAndProcessImage(context.contentResolver, it) }
     }
 
-    // Camera state
     var camera by remember { mutableStateOf<Camera?>(null) }
 
-    // Torch state từ LiveData thực (không optimistic)
     val torchLiveData = remember(camera) {
         camera?.cameraInfo?.torchState ?: MutableLiveData(TorchState.OFF)
     }
@@ -136,7 +134,6 @@ fun ArDrawingScreen(
     val isFlashOn    = torchState == TorchState.ON
     val hasFlashUnit = remember(camera) { camera?.cameraInfo?.hasFlashUnit() == true }
 
-    // TransformState: stable holder — zero parent recomposition trong gesture loop
     val transformState = remember {
         TransformState(
             initialScale    = uiState.savedScale,
@@ -145,24 +142,20 @@ fun ArDrawingScreen(
         )
     }
 
-    // V5 fix: sessionStartBitmapId — không reset transform khi xoay màn hình
     val sessionStartBitmapId = remember { uiState.bitmapId }
     LaunchedEffect(uiState.bitmapId) {
         if (uiState.bitmapId > sessionStartBitmapId) transformState.reset()
     }
 
-    // Opacity local để Slider mượt
     var localOpacity by remember { mutableFloatStateOf(uiState.opacity) }
     LaunchedEffect(uiState.opacity) { localOpacity = uiState.opacity }
 
-    // BitmapHandle lifecycle
     val bitmapHandle = uiState.bitmapHandle
     DisposableEffect(bitmapHandle) {
         bitmapHandle?.retain()
         onDispose { bitmapHandle?.release() }
     }
 
-    // Sync gesture → ViewModel khi dispose
     val transformRef by rememberUpdatedState(transformState)
     DisposableEffect(Unit) {
         onDispose {
@@ -175,7 +168,6 @@ fun ArDrawingScreen(
         }
     }
 
-    // Error handling
     LaunchedEffect(uiState.processingError) {
         uiState.processingError?.let {
             snackbarState.showSnackbar(it); viewModel.clearError()
@@ -187,7 +179,6 @@ fun ArDrawingScreen(
         }
     }
 
-    // Permission gate
     if (!cameraPermission.status.isGranted) {
         PermissionRequestScreen(
             isPermanentlyDenied = isPermanentlyDenied,
@@ -206,17 +197,14 @@ fun ArDrawingScreen(
         return
     }
 
-    // ── Main UI ───────────────────────────────────────────────────────────
     Box(modifier = modifier.fillMaxSize()) {
 
-        // Layer 1: Camera preview
         CameraPreviewLayer(
             modifier      = Modifier.fillMaxSize(),
             onCameraReady = { cam -> camera = cam },
             onCameraError = { msg -> viewModel.onCameraError(msg) }
         )
 
-        // Layer 2: Line art overlay
         val bitmap = bitmapHandle?.bitmap?.takeIf { !it.isRecycled }
         if (bitmap != null) {
             ImageOverlayLayer(
@@ -229,7 +217,7 @@ fun ArDrawingScreen(
             NoImagePlaceholder(modifier = Modifier.fillMaxSize())
         }
 
-        // Layer 3: Loading indicator
+        // Loading indicator
         AnimatedVisibility(
             visible  = uiState.isProcessing,
             enter    = fadeIn(),
@@ -247,17 +235,17 @@ fun ArDrawingScreen(
                         modifier = Modifier.size(56.dp)
                     )
                     Spacer(Modifier.height(16.dp))
-                    Text("Đang xử lý ảnh...", color = Color.White, fontSize = 16.sp)
-                    Spacer(Modifier.height(6.dp))
                     Text(
-                        "Otsu auto-threshold...",
-                        color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp
+                        text = when (uiState.displayMode) {
+                            DisplayMode.ORIGINAL -> "Đang tải ảnh gốc..."
+                            DisplayMode.LINE_ART -> "Đang tạo line art..."
+                        },
+                        color = Color.White, fontSize = 16.sp
                     )
                 }
             }
         }
 
-        // Layer 4: Control panel
         ControlPanel(
             modifier                = Modifier
                 .align(Alignment.BottomCenter)
@@ -267,6 +255,7 @@ fun ArDrawingScreen(
             isFlashOn               = isFlashOn,
             hasFlashUnit            = hasFlashUnit,
             hasImage                = bitmap != null && !uiState.isProcessing,
+            displayMode             = uiState.displayMode,
             onOpacityChange         = { localOpacity = it },
             onOpacityChangeFinished = { viewModel.updateOpacity(localOpacity) },
             onPickImage             = {
@@ -274,8 +263,8 @@ fun ArDrawingScreen(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                 )
             },
-            onToggleLock   = { viewModel.toggleLock() },
-            onToggleFlash  = {
+            onToggleLock  = { viewModel.toggleLock() },
+            onToggleFlash = {
                 camera?.let { cam ->
                     if (cam.cameraInfo.hasFlashUnit()) {
                         val on = cam.cameraInfo.torchState.value == TorchState.ON
@@ -289,6 +278,8 @@ fun ArDrawingScreen(
                     }
                 }
             },
+            // V7: toggle mode → re-process ảnh hiện tại
+            onToggleMode  = { viewModel.toggleDisplayMode(context.contentResolver) },
             onResetTransform = {
                 transformState.reset()
                 viewModel.saveGestureTransform(1f, 0f, 0f, 0f)
@@ -329,13 +320,11 @@ fun CameraPreviewLayer(
     DisposableEffect(lifecycleOwner) {
         var disposed: Boolean = false
         var cameraProvider: ProcessCameraProvider? = null
-
         val future   = ProcessCameraProvider.getInstance(context)
         val listener = Runnable {
             if (disposed) return@Runnable
             try {
                 cameraProvider = future.get()
-
                 val selector = when {
                     cameraProvider!!.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)
                         -> CameraSelector.DEFAULT_BACK_CAMERA
@@ -346,20 +335,17 @@ fun CameraPreviewLayer(
                         return@Runnable
                     }
                 }
-
                 val preview = Preview.Builder().build().also {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
                 cameraProvider!!.unbindAll()
                 val cam = cameraProvider!!.bindToLifecycle(lifecycleOwner, selector, preview)
                 if (!disposed) onCameraReady(cam)
-
             } catch (e: Exception) {
                 Log.e("CameraLayer", "Init failed: ${e.message}", e)
                 if (!disposed) onCameraError(e.localizedMessage ?: "Lỗi camera")
             }
         }
-
         future.addListener(listener, ContextCompat.getMainExecutor(context))
         onDispose { disposed = true; cameraProvider?.unbindAll() }
     }
@@ -379,10 +365,9 @@ fun ImageOverlayLayer(
     transformState : TransformState
 ) {
     val imageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
-
     Image(
         bitmap             = imageBitmap,
-        contentDescription = "Ảnh đường nét để đồ",
+        contentDescription = "Ảnh overlay",
         contentScale       = ContentScale.Fit,
         modifier           = Modifier
             .fillMaxSize()
@@ -401,8 +386,8 @@ fun ImageOverlayLayer(
                             scale    = (transformState.scale * zoom).coerceIn(0.1f, 10f),
                             rotation = transformState.rotation + rotDelta,
                             offset   = Offset(
-                                x = transformState.offset.x + pan.x,
-                                y = transformState.offset.y + pan.y
+                                transformState.offset.x + pan.x,
+                                transformState.offset.y + pan.y
                             )
                         )
                     }
@@ -412,7 +397,7 @@ fun ImageOverlayLayer(
 }
 
 // ============================================================================
-// CONTROL PANEL
+// CONTROL PANEL — V7: thêm nút Toggle Mode
 // ============================================================================
 
 @Composable
@@ -423,11 +408,13 @@ fun ControlPanel(
     isFlashOn               : Boolean,
     hasFlashUnit            : Boolean,
     hasImage                : Boolean,
+    displayMode             : DisplayMode,
     onOpacityChange         : (Float) -> Unit,
     onOpacityChangeFinished : () -> Unit,
     onPickImage             : () -> Unit,
     onToggleLock            : () -> Unit,
     onToggleFlash           : () -> Unit,
+    onToggleMode            : () -> Unit,  // V7 MỚI
     onResetTransform        : () -> Unit
 ) {
     Column(
@@ -438,23 +425,27 @@ fun ControlPanel(
             .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Opacity Slider
+        // Mode indicator + Opacity slider
         Column {
             Row(
                 modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment     = Alignment.CenterVertically
             ) {
+                // V7: Hiện mode đang active
                 Text(
-                    text       = "Độ mờ",
-                    color      = Color.White,
-                    fontSize   = 13.sp,
-                    fontWeight = FontWeight.Medium
+                    text = when (displayMode) {
+                        DisplayMode.ORIGINAL -> "🖼️ Ảnh gốc"
+                        DisplayMode.LINE_ART -> "✏️ Line Art"
+                    },
+                    color      = MaterialTheme.colorScheme.primary,
+                    fontSize   = 12.sp,
+                    fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text     = "${(opacity * 100).toInt()}%",
+                    text     = "Độ mờ ${(opacity * 100).toInt()}%",
                     color    = Color.White.copy(alpha = 0.7f),
-                    fontSize = 13.sp
+                    fontSize = 12.sp
                 )
             }
             Slider(
@@ -471,25 +462,52 @@ fun ControlPanel(
             )
         }
 
-        // Action Buttons
+        // Buttons
         Row(
             modifier              = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment     = Alignment.CenterVertically
         ) {
+            // Chọn ảnh
             ControlButton(
                 onClick  = onPickImage,
                 label    = "Chọn ảnh",
                 isActive = false,
+                icon     = { Icon(Icons.Default.AddPhotoAlternate, null, tint = Color.White) }
+            )
+
+            // V7 MỚI: Toggle mode ORIGINAL ↔ LINE_ART
+            ControlButton(
+                onClick  = onToggleMode,
+                enabled  = hasImage,
+                label    = when (displayMode) {
+                    DisplayMode.ORIGINAL -> "Ảnh gốc"
+                    DisplayMode.LINE_ART -> "Line Art"
+                },
+                isActive = true,  // Luôn highlight để dễ thấy
                 icon     = {
-                    Icon(Icons.Default.AddPhotoAlternate, "Chọn ảnh", tint = Color.White)
+                    Icon(
+                        imageVector = when (displayMode) {
+                            // Icon ảnh gốc: hình ảnh màu
+                            DisplayMode.ORIGINAL -> Icons.Default.Image
+                            // Icon line art: ngôi sao/bút vẽ
+                            DisplayMode.LINE_ART -> Icons.Default.AutoAwesome
+                        },
+                        contentDescription = "Toggle mode",
+                        tint = when (displayMode) {
+                            DisplayMode.ORIGINAL -> Color(0xFFFFD54F)  // Vàng = ảnh gốc
+                            DisplayMode.LINE_ART -> Color(0xFF80DEEA)  // Xanh = line art
+                        }
+                    )
                 }
             )
+
+            // Khóa hình
             ControlButton(
                 onClick  = onToggleLock,
+                enabled  = hasImage,
                 label    = if (isLocked) "Đã khóa" else "Khóa hình",
                 isActive = isLocked,
-                enabled  = hasImage,
                 icon     = {
                     Icon(
                         imageVector = if (isLocked) Icons.Default.Lock else Icons.Default.LockOpen,
@@ -498,6 +516,8 @@ fun ControlPanel(
                     )
                 }
             )
+
+            // Đèn pin
             if (hasFlashUnit) {
                 ControlButton(
                     onClick  = onToggleFlash,
@@ -505,23 +525,21 @@ fun ControlPanel(
                     isActive = isFlashOn,
                     icon     = {
                         Icon(
-                            imageVector        = if (isFlashOn) Icons.Default.FlashOn
-                                               else Icons.Default.FlashOff,
+                            imageVector = if (isFlashOn) Icons.Default.FlashOn else Icons.Default.FlashOff,
                             contentDescription = null,
-                            tint               = if (isFlashOn) Color(0xFFFFEB3B)
-                                               else Color.White
+                            tint = if (isFlashOn) Color(0xFFFFEB3B) else Color.White
                         )
                     }
                 )
             }
+
+            // Đặt lại
             ControlButton(
                 onClick  = onResetTransform,
+                enabled  = hasImage,
                 label    = "Đặt lại",
                 isActive = false,
-                enabled  = hasImage,
-                icon     = {
-                    Icon(Icons.Default.RestartAlt, null, tint = Color.White)
-                }
+                icon     = { Icon(Icons.Default.RestartAlt, null, tint = Color.White) }
             )
         }
     }
@@ -589,7 +607,7 @@ fun NoImagePlaceholder(modifier: Modifier = Modifier) {
                 modifier           = Modifier.size(64.dp)
             )
             Text(
-                text       = "Nhấn \"Chọn ảnh\" để tải ảnh tham chiếu\nrồi đặt lên camera để đồ nét",
+                text       = "Nhấn \"Chọn ảnh\" để bắt đầu\nToggle 🖼️↔✏️ để đổi chế độ hiển thị",
                 color      = Color.White.copy(alpha = 0.6f),
                 textAlign  = TextAlign.Center,
                 fontSize   = 14.sp,
@@ -620,19 +638,12 @@ fun PermissionRequestScreen(
                 tint               = MaterialTheme.colorScheme.primary,
                 modifier           = Modifier.size(72.dp)
             )
-            Text(
-                text       = "AR Drawing",
-                color      = Color.White,
-                fontSize   = 24.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Text("AR Drawing", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             if (isPermanentlyDenied) {
                 Text(
-                    text       = "Quyền Camera bị từ chối vĩnh viễn.\nVui lòng mở Settings để cấp quyền.",
-                    color      = Color.White.copy(alpha = 0.7f),
-                    textAlign  = TextAlign.Center,
-                    fontSize   = 14.sp,
-                    lineHeight = 20.sp
+                    "Quyền Camera bị từ chối vĩnh viễn.\nVui lòng mở Settings để cấp quyền.",
+                    color = Color.White.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center, fontSize = 14.sp, lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth(0.7f)) {
@@ -640,11 +651,9 @@ fun PermissionRequestScreen(
                 }
             } else {
                 Text(
-                    text       = "App cần quyền Camera để hoạt động.\nẢnh từ thư viện không cần quyền bổ sung.",
-                    color      = Color.White.copy(alpha = 0.7f),
-                    textAlign  = TextAlign.Center,
-                    fontSize   = 14.sp,
-                    lineHeight = 20.sp
+                    "App cần quyền Camera để hoạt động.\nẢnh từ thư viện không cần quyền bổ sung.",
+                    color = Color.White.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center, fontSize = 14.sp, lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = onRequestPermission, modifier = Modifier.fillMaxWidth(0.7f)) {
