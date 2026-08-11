@@ -8,34 +8,52 @@ import android.net.Uri
 import android.util.Log
 import androidx.exifinterface.media.ExifInterface
 import com.example.ardrawing.data.BitmapHandle.Companion.recycleIfNotRecycled
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.segmentation.Segmentation
+import com.google.mlkit.vision.segmentation.SegmentationMask
+import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.nio.FloatBuffer
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.min
-import kotlin.math.sqrt
+import kotlin.math.pow
 
 /**
- * ImageProcessor V6 — Nâng cấp cho ảnh thật (photo), không chỉ line art.
+ * ImageProcessor V9 — ML Kit Selfie Segmentation + Color Dodge Pencil Sketch.
  *
- * Thay đổi so với V5:
- * ┌─────────────────────────────────────────────────────────┐
- * │ V5 (line art only):                                     │
- * │  Gray → Blur3×3 → Sobel(fixedThreshold) → transparent  │
- * │                                                         │
- * │ V6 (any photo):                                         │
- * │  Gray → Blur3×3 → Blur3×3 → Sobel+Otsu → smooth gray  │
- * │         ↑ double pass       ↑ auto-thresh  ↑ Multiply  │
- * └─────────────────────────────────────────────────────────┘
+ * ┌──────────────────────────────────────────────────────────────────┐
+ * │ V9 Pipeline (LINE_ART mode):                                     │
+ * │                                                                  │
+ * │  Photo                                                           │
+ * │   ↓ decode + EXIF + downscale                                    │
+ * │   ├─→ ML Kit Segmentation ──────────→ foreground mask            │
+ * │   └─→ Grayscale → Color Dodge Sketch                             │
+ * │              ↓                                                   │
+ * │         Composite blend:                                         │
+ * │           foreground → pencil sketch (transparent bg)            │
+ * │           background → fully transparent (camera shows through)  │
+ * │              ↓                                                   │
+ * │         Result: sketch của người nổi trên camera feed            │
+ * └──────────────────────────────────────────────────────────────────┘
  *
- * Otsu's method: tự tìm threshold tối ưu từ histogram gradient
- *   → không cần user chỉnh threshold thủ công cho từng ảnh
+ * Color Dodge algorithm (verified từ Python testing):
+ *   1. Gray → Invert
+ *   2. Invert → Box Blur lớn (radius=40, 3 passes ≈ Gaussian σ≈25)
+ *   3. Color Dodge: sketch = gray × 255 / (255 - blurred)
+ *   4. Power curve: output = pow(sketch/255, 0.4) × 255
+ *   → Kết quả: nền trắng, nét chì xám như app gốc ✓
  *
- * Output: transparent bg + smooth gray edges (0-200)
- *   → dùng với BlendMode.Multiply trong ImageOverlayLayer
- *   → transparent × camera = camera (pass-through)
- *   → dark_gray × camera = darkened (natural pencil line)
+ * ML Kit Selfie Segmentation:
+ *   - On-device model, không cần internet (bundled via AndroidManifest)
+ *   - Detect người (foreground) vs nền (background)
+ *   - fgConfidence > 0.5 = foreground → giữ sketch
+ *   - fgConfidence ≤ 0.5 = background → transparent (xóa sketch)
  */
 class ImageProcessor {
 
@@ -43,39 +61,84 @@ class ImageProcessor {
         private const val TAG = "ImageProcessor"
         const val MAX_OUTPUT_WIDTH  = 1920
         const val MAX_OUTPUT_HEIGHT = 1080
-        const val DEFAULT_THRESHOLD = 30  // 0=nhiều cạnh, 100=ít cạnh
+        const val DEFAULT_THRESHOLD = 30
 
-        // Sobel 3×3 đúng: max|Gx| = max|Gy| = 4×255 = 1020
-        // magnitude_max = sqrt(1020² + 1020²) = 1020×√2 ≈ 1442.22
-        private const val SOBEL_SINGLE_MAX = 1020
-        private val SOBEL_MAG_MAX = SOBEL_SINGLE_MAX * sqrt(2.0)  // 1442.22
-        private val SOBEL_SQ_MAX  = SOBEL_SINGLE_MAX.toLong() * SOBEL_SINGLE_MAX * 2L
+        // Color Dodge parameters (verified via Python testing với ảnh thật)
+        private const val BLUR_RADIUS = 40   // Box blur radius (≈ Gaussian r=40 trong Python)
+        private const val BLUR_PASSES = 3    // 3 passes ≈ Gaussian σ≈25px
+        private const val POWER_CURVE = 0.4  // Tone curve: 0.4 → best match với app gốc
+
+        // Segmentation thresholds
+        private const val FG_HARD  = 0.5f   // Trên ngưỡng này → hoàn toàn là người
+        private const val FG_SOFT  = 0.25f  // Dưới ngưỡng này → hoàn toàn là nền
+        // Giữa FG_SOFT và FG_HARD → transition mềm (tránh edge artifact)
     }
 
-    /**
-     * Pipeline V6:
-     * decode → EXIF → downscale → grayscale → blur×2 → Sobel+Otsu → output
-     *
-     * @param threshold 0-100: điều chỉnh Otsu multiplier
-     *   0  → 0.10× Otsu (rất nhạy, show nhiều cạnh, có thể noisy)
-     *   30 → 1.00× Otsu (tối ưu tự động — DEFAULT)
-     *   60 → 2.00× Otsu (chọn lọc, chỉ cạnh rõ)
-     *   100→ 3.33× Otsu (chỉ cạnh rất mạnh)
-     */
+    // =========================================================================
+    // ML Kit Segmenter — khởi tạo một lần, tái sử dụng
+    // SelfieSegmenterOptions:
+    //   SINGLE_IMAGE_MODE: tối ưu cho ảnh tĩnh (không phải video)
+    //   enableRawSizeMask(): mask có cùng kích thước với input image
+    // =========================================================================
+    private val segmenter = Segmentation.getClient(
+        SelfieSegmenterOptions.Builder()
+            .setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE)
+            .enableRawSizeMask()
+            .build()
+    )
+
+    /** Gọi trong ViewModel.onCleared() để giải phóng ML Kit resources */
+    fun close() {
+        try { segmenter.close() }
+        catch (e: Exception) { Log.w(TAG, "Segmenter close error: ${e.message}") }
+    }
+
+    // =========================================================================
+    // ORIGINAL MODE: Ảnh màu gốc làm mờ (không xử lý)
+    // =========================================================================
+    suspend fun loadOriginal(contentResolver: ContentResolver, uri: Uri): Bitmap {
+        var prev: Bitmap? = null
+        return try {
+            withContext(Dispatchers.Default) {
+                val decoded = withContext(Dispatchers.IO) { decodeSampledBitmap(contentResolver, uri) }
+                prev = decoded
+                currentCoroutineContext().ensureActive()
+
+                val rotated = withContext(Dispatchers.IO) { applyExifRotation(decoded, contentResolver, uri) }
+                if (rotated !== decoded) decoded.recycleIfNotRecycled()
+                prev = rotated
+                currentCoroutineContext().ensureActive()
+
+                val scaled = downscaleToMax(rotated)
+                if (scaled !== rotated) rotated.recycleIfNotRecycled()
+                prev = null
+                scaled
+            }
+        } catch (e: Exception) { prev?.recycleIfNotRecycled(); throw e }
+    }
+
+    // =========================================================================
+    // LINE_ART MODE: ML Kit Segmentation + Color Dodge Pencil Sketch
+    //
+    // @param threshold 0-100:
+    //   Thấp (0-20)  → FG threshold thấp → detect nhiều foreground hơn
+    //   Vừa (30-50)  → FG threshold cân bằng (default)
+    //   Cao (60-100) → FG threshold cao → chỉ detect foreground rõ ràng
+    // =========================================================================
     suspend fun loadAndProcess(
         contentResolver: ContentResolver,
         uri: Uri,
         threshold: Int = DEFAULT_THRESHOLD
     ): Bitmap {
-        var prevBitmap: Bitmap? = null
+        var prev: Bitmap? = null
         return try {
             withContext(Dispatchers.Default) {
 
-                // B1: Decode tối ưu (IO thread)
+                // B1: Decode (IO thread)
                 val decoded = withContext(Dispatchers.IO) {
                     decodeSampledBitmap(contentResolver, uri)
                 }
-                prevBitmap = decoded
+                prev = decoded
                 currentCoroutineContext().ensureActive()
 
                 // B2: EXIF rotation (IO thread)
@@ -83,57 +146,259 @@ class ImageProcessor {
                     applyExifRotation(decoded, contentResolver, uri)
                 }
                 if (rotated !== decoded) decoded.recycleIfNotRecycled()
-                prevBitmap = rotated
+                prev = rotated
                 currentCoroutineContext().ensureActive()
 
                 // B3: Downscale về MAX_OUTPUT
                 val scaled = downscaleToMax(rotated)
                 if (scaled !== rotated) rotated.recycleIfNotRecycled()
-                prevBitmap = scaled
+                prev = scaled
                 currentCoroutineContext().ensureActive()
 
-                // B4: Grayscale (BT.601)
+                // B4: ML Kit Segmentation
+                // Trả về FloatArray (foreground confidence mỗi pixel, 0.0-1.0)
+                // Fallback về null nếu ML Kit fail → dùng sketch toàn ảnh
+                val fgMask: FloatArray? = try {
+                    runSegmentation(scaled)
+                } catch (e: Exception) {
+                    Log.w(TAG, "ML Kit segmentation failed, fallback: ${e.message}")
+                    null  // Fallback: áp sketch cho toàn ảnh
+                }
+                currentCoroutineContext().ensureActive()
+
+                // B5: Grayscale
                 val gray = toGrayscale(scaled)
                 scaled.recycleIfNotRecycled()
-                prevBitmap = gray
+                prev = gray
                 currentCoroutineContext().ensureActive()
 
-                // B5a: Gaussian Blur lần 1
-                // V6 THAY ĐỔI: apply blur 2 lần thay vì 1 lần.
-                // 3×3 × 2 lần ≈ Gaussian σ=√2 — noise suppression tốt hơn cho real photos.
-                // Ảnh thật có texture phức tạp (da người, vải, tường) tạo false-positive edges.
-                // Double blur loại bỏ texture noise trước khi Sobel detect.
-                val blurred1 = gaussianBlur3x3(gray)
+                // B6: Color Dodge + Segmentation Blend
+                // threshold → fgConfidenceThreshold
+                val fgThresh = 0.25f + (threshold / 100f) * 0.4f
+                // threshold=0  → 0.25 (aggressive foreground)
+                // threshold=30 → 0.37 (balanced)
+                // threshold=100→ 0.65 (conservative foreground)
+                val result = colorDodgeWithSegmentation(gray, fgMask, fgThresh)
                 gray.recycleIfNotRecycled()
-                prevBitmap = blurred1
-                currentCoroutineContext().ensureActive()
+                prev = null
 
-                // B5b: Gaussian Blur lần 2
-                val blurred2 = gaussianBlur3x3(blurred1)
-                blurred1.recycleIfNotRecycled()
-                prevBitmap = blurred2
-                currentCoroutineContext().ensureActive()
-
-                // B6: Sobel + Otsu auto-threshold → smooth edge output
-                // V6 THAY ĐỔI: thay sobelToLineArt (fixed threshold) bằng sobelWithOtsu.
-                // Otsu tự tính threshold tối ưu từ histogram → hoạt động với mọi loại ảnh.
-                // threshold slider → Otsu multiplier: threshold=30 dùng đúng Otsu.
-                val otsuMultiplier = (threshold / 30f).coerceIn(0.1f, 4.0f)
-                val result = sobelWithOtsuToLineArt(blurred2, otsuMultiplier)
-                blurred2.recycleIfNotRecycled()
-                prevBitmap = null  // result là output, KHÔNG recycle
-
-                Log.d(TAG, "V6 Pipeline OK: ${result.width}×${result.height}")
+                Log.d(TAG, "V9 OK: ${result.width}×${result.height}, fgThresh=$fgThresh")
                 result
             }
         } catch (e: Exception) {
-            prevBitmap?.recycleIfNotRecycled()
-            throw e  // Re-throw tất cả (kể cả CancellationException)
+            prev?.recycleIfNotRecycled()
+            throw e
         }
     }
 
     // =========================================================================
-    // DECODE
+    // ML Kit SEGMENTATION
+    // Trả về FloatArray[width×height] với giá trị 0.0-1.0
+    //   > 0.5 = foreground (người)
+    //   < 0.5 = background (nền phòng)
+    // =========================================================================
+    private suspend fun runSegmentation(bitmap: Bitmap): FloatArray {
+        val inputImage = InputImage.fromBitmap(bitmap, 0)
+
+        // suspendCancellableCoroutine: chuyển Task<> callback thành suspend function
+        val mask: SegmentationMask = suspendCancellableCoroutine { cont ->
+            segmenter.process(inputImage)
+                .addOnSuccessListener { segMask -> cont.resume(segMask) }
+                .addOnFailureListener { e -> cont.resumeWithException(e) }
+        }
+
+        // Đọc toàn bộ mask buffer thành FloatArray
+        // enableRawSizeMask() đảm bảo mask.width == bitmap.width, mask.height == bitmap.height
+        val buffer = mask.buffer
+        buffer.rewind()
+        val floatBuffer: FloatBuffer = buffer.asFloatBuffer()
+        val result = FloatArray(mask.width * mask.height)
+        floatBuffer.get(result)
+
+        Log.d(TAG, "Segmentation mask: ${mask.width}×${mask.height}, " +
+                   "fg pixels=${result.count { it > 0.5f } * 100 / result.size}%")
+        return result
+    }
+
+    // =========================================================================
+    // COLOR DODGE PENCIL SKETCH + SEGMENTATION BLEND
+    //
+    // Color Dodge (từ Python testing, params verified):
+    //   gray → invert → heavy box blur → dodge blend → power curve
+    //
+    // Segmentation blend:
+    //   fgConf >= fgThresh → foreground: áp sketch (transparent bg + dark strokes)
+    //   fgConf < softThresh → background: transparent (camera shows through)
+    //   Giữa hai ngưỡng → smooth transition tránh hard edges
+    //
+    // Output ARGB:
+    //   Nét chì (stroke) → opaque black (A>0, RGB=0)
+    //   Nền người (paper) → near-transparent
+    //   Nền phòng → fully transparent (A=0)
+    // =========================================================================
+    private suspend fun colorDodgeWithSegmentation(
+        gray: Bitmap,
+        fgMask: FloatArray?,
+        fgThresh: Float
+    ): Bitmap {
+        val w = gray.width; val h = gray.height; val total = w * h
+        val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+        try {
+            // ── Load grayscale pixels ────────────────────────────────────────
+            val gPx = IntArray(total)
+            gray.getPixels(gPx, 0, w, 0, 0, w, h)
+            val gArr = FloatArray(total) { (gPx[it] and 0xFF).toFloat() }
+            currentCoroutineContext().ensureActive()
+
+            // ── Color Dodge Step 1: Invert ────────────────────────────────────
+            val invArr = FloatArray(total) { 255f - gArr[it] }
+
+            // ── Color Dodge Step 2: Heavy Box Blur ───────────────────────────
+            // 3 passes × radius=40 ≈ Gaussian σ=25px
+            // Blur lớn → vùng đồng nhất (nền) về 255 → dodge=255 (trắng)
+            // Vùng chi tiết (người) giữ gradient → dodge thấp hơn (nét)
+            val blurred = heavyBoxBlur(invArr, w, h, BLUR_RADIUS, BLUR_PASSES)
+            currentCoroutineContext().ensureActive()
+
+            // ── Color Dodge Step 3: Dodge Blend + Power Curve ────────────────
+            // dodge = gray × 255 / (255 - blurred)    [Color Dodge formula]
+            // sketch = pow(dodge/255, 0.4) × 255       [Tone curve, verified]
+            val sketchArr = FloatArray(total)
+            for (i in 0 until total) {
+                val denom = (255f - blurred[i]).coerceAtLeast(1f)
+                val dodge = (gArr[i] * 255f / denom).coerceIn(0f, 255f)
+                sketchArr[i] = (Math.pow(dodge.toDouble() / 255.0, POWER_CURVE) * 255.0)
+                    .toFloat().coerceIn(0f, 255f)
+            }
+            currentCoroutineContext().ensureActive()
+
+            // ── Segmentation Blend ───────────────────────────────────────────
+            val softThresh = FG_SOFT  // Below this = definitely background
+            val outPx = IntArray(total)
+
+            for (i in 0 until total) {
+                val sketchVal = sketchArr[i]
+
+                if (fgMask == null) {
+                    // Fallback (no segmentation): áp sketch cho toàn ảnh
+                    val alpha = (255f - sketchVal).coerceIn(0f, 255f).toInt()
+                    outPx[i] = (alpha shl 24) or 0x00000000
+                    continue
+                }
+
+                val fgConf = fgMask[i].coerceIn(0f, 1f)
+
+                when {
+                    fgConf >= fgThresh -> {
+                        // ── FOREGROUND (người) ─────────────────────────────
+                        // Pencil sketch overlay:
+                        //   sketch=255 (paper/white) → alpha=0 (trong suốt, camera xuyên qua)
+                        //   sketch=100 (gray stroke) → alpha=155 (semi-opaque, nét thấy được)
+                        //   sketch=0   (dark stroke) → alpha=255 (opaque, nét đậm nhất)
+                        val alpha = (255f - sketchVal).coerceIn(0f, 255f).toInt()
+                        outPx[i] = (alpha shl 24) or 0x00000000
+                    }
+
+                    fgConf >= softThresh -> {
+                        // ── TRANSITION ZONE (edge người/nền) ──────────────
+                        // Fade out sketch để tránh hard edge artifact
+                        // Smooth linear blend từ soft→hard threshold
+                        val blend = (fgConf - softThresh) / (fgThresh - softThresh)
+                        val alpha = ((255f - sketchVal) * blend).coerceIn(0f, 255f).toInt()
+                        outPx[i] = (alpha shl 24) or 0x00000000
+                    }
+
+                    else -> {
+                        // ── BACKGROUND (nền phòng) ─────────────────────────
+                        // Fully transparent → camera feed hiện nguyên
+                        // Người dùng thấy trực tiếp không gian xung quanh
+                        outPx[i] = 0x00000000
+                    }
+                }
+            }
+
+            output.setPixels(outPx, 0, w, 0, 0, w, h)
+            return output
+
+        } catch (e: Exception) {
+            output.recycleIfNotRecycled()
+            throw e
+        }
+    }
+
+    // =========================================================================
+    // HEAVY BOX BLUR — Separable, prefix sum, O(n) per pass
+    //
+    // Tại sao Box Blur thay Gaussian nhỏ:
+    //   Pencil Sketch cần blur RẤT LỚN (radius=40)
+    //   Gaussian 3×3 (r=1) không đủ → vẫn ra Sobel-like noise
+    //   Box Blur r=40 → window 81×81px → smooth rất mạnh
+    //   3 passes Box Blur ≈ Gaussian (Central Limit Theorem)
+    //
+    // Memory: 3 IntArray × w×h → 3 × 8MB = 24MB cho 1080p
+    // Speed: O(w×h) per pass → ~2M ops × 6 passes = ~12M ops → <200ms
+    // =========================================================================
+    private suspend fun heavyBoxBlur(
+        src: FloatArray,
+        w: Int, h: Int,
+        radius: Int,
+        passes: Int
+    ): FloatArray {
+        // 3 buffer slots: rotate references giữa các passes
+        val buf   = Array(3) { if (it == 0) src else FloatArray(src.size) }
+        val prefW = IntArray(w + 1)   // Prefix sum buffer cho horizontal
+        val prefH = IntArray(h + 1)   // Prefix sum buffer cho vertical
+
+        var curIdx = 0
+        for (pass in 0 until passes) {
+            val hIdx = (curIdx + 1) % 3   // H-pass output slot
+            val vIdx = (curIdx + 2) % 3   // V-pass output slot
+
+            // ── Horizontal pass ────────────────────────────────────────────
+            // Mỗi pixel = trung bình của [x-r, x+r] trong hàng y
+            for (y in 0 until h) {
+                if (y % 100 == 0) currentCoroutineContext().ensureActive()
+                val base = y * w
+                // Build prefix sum
+                prefW[0] = 0
+                for (x in 0 until w) {
+                    prefW[x + 1] = prefW[x] + buf[curIdx][base + x].toInt()
+                }
+                // Apply box average
+                for (x in 0 until w) {
+                    val lo  = (x - radius).coerceAtLeast(0)
+                    val hi  = (x + radius).coerceAtMost(w - 1)
+                    val cnt = hi - lo + 1
+                    buf[hIdx][base + x] = (prefW[hi + 1] - prefW[lo]).toFloat() / cnt
+                }
+            }
+
+            // ── Vertical pass ──────────────────────────────────────────────
+            // Mỗi pixel = trung bình của [y-r, y+r] trong cột x
+            for (x in 0 until w) {
+                if (x % 200 == 0) currentCoroutineContext().ensureActive()
+                // Build prefix sum
+                prefH[0] = 0
+                for (y in 0 until h) {
+                    prefH[y + 1] = prefH[y] + buf[hIdx][y * w + x].toInt()
+                }
+                // Apply box average
+                for (y in 0 until h) {
+                    val lo  = (y - radius).coerceAtLeast(0)
+                    val hi  = (y + radius).coerceAtMost(h - 1)
+                    val cnt = hi - lo + 1
+                    buf[vIdx][y * w + x] = (prefH[hi + 1] - prefH[lo]).toFloat() / cnt
+                }
+            }
+
+            curIdx = vIdx
+        }
+        return buf[curIdx]
+    }
+
+    // =========================================================================
+    // DECODE + EXIF + DOWNSCALE (dùng chung)
     // =========================================================================
 
     private fun decodeSampledBitmap(contentResolver: ContentResolver, uri: Uri): Bitmap {
@@ -144,47 +409,44 @@ class ImageProcessor {
             inSampleSize = ss
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        return contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream, null, decOpts)
-        } ?: error("Không thể mở stream từ URI: $uri")
+        return contentResolver.openInputStream(uri)?.use { s ->
+            BitmapFactory.decodeStream(s, null, decOpts)
+        } ?: error("Không thể mở URI: $uri")
     }
 
-    // V5 fix #4: OR condition + pixel budget + guard outW/H<=0
     internal fun calculateInSampleSize(outW: Int, outH: Int, reqW: Int, reqH: Int): Int {
         if (outW <= 0 || outH <= 0) return 1
         var ss = 1
         if (outH > reqH || outW > reqW) {
             val hH = outH / 2; val hW = outW / 2
             while ((hH / ss) >= reqH || (hW / ss) >= reqW) {
-                if (ss >= 32768) break
-                ss *= 2
+                if (ss >= 32768) break; ss *= 2
             }
         }
-        val pixelBudget = reqW.toLong() * reqH * 4
-        while (ss < 32768 && (outW.toLong() / ss) * (outH / ss) > pixelBudget) ss *= 2
+        val budget = reqW.toLong() * reqH * 4
+        while (ss < 32768 && (outW.toLong() / ss) * (outH / ss) > budget) ss *= 2
         return ss
     }
 
     private fun applyExifRotation(source: Bitmap, contentResolver: ContentResolver, uri: Uri): Bitmap {
         val orientation = try {
-            contentResolver.openInputStream(uri)?.use { stream ->
-                ExifInterface(stream).getAttributeInt(
+            contentResolver.openInputStream(uri)?.use { s ->
+                ExifInterface(s).getAttributeInt(
                     ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
             } ?: ExifInterface.ORIENTATION_NORMAL
         } catch (e: IOException) { ExifInterface.ORIENTATION_NORMAL }
-
-        val matrix = Matrix()
+        val m = Matrix()
         when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90     -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180    -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270    -> matrix.postRotate(270f)
-            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
-            ExifInterface.ORIENTATION_FLIP_VERTICAL   -> matrix.postScale(1f, -1f)
-            ExifInterface.ORIENTATION_TRANSPOSE -> { matrix.postRotate(90f); matrix.postScale(-1f, 1f) }
-            ExifInterface.ORIENTATION_TRANSVERSE -> { matrix.postRotate(-90f); matrix.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_90    -> m.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180   -> m.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270   -> m.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL   -> m.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE  -> { m.postRotate(90f); m.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(-90f);m.postScale(-1f, 1f) }
             else -> return source
         }
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, m, true)
     }
 
     private fun downscaleToMax(source: Bitmap): Bitmap {
@@ -195,10 +457,6 @@ class ImageProcessor {
             (sw * f).toInt().coerceAtLeast(1),
             (sh * f).toInt().coerceAtLeast(1), true)
     }
-
-    // =========================================================================
-    // IMAGE PROCESSING
-    // =========================================================================
 
     // BT.601: Y = 0.299R + 0.587G + 0.114B
     private suspend fun toGrayscale(source: Bitmap): Bitmap {
@@ -220,205 +478,5 @@ class ImageProcessor {
             }
             return output
         } catch (e: Exception) { output.recycleIfNotRecycled(); throw e }
-    }
-
-    // Gaussian Blur 3×3 — kernel [[1,2,1],[2,4,2],[1,2,1]] / 16
-    // Sliding 3-row window: peak memory = 3 rows (tiny) + output bitmap
-    private suspend fun gaussianBlur3x3(source: Bitmap): Bitmap {
-        val w = source.width; val h = source.height
-        val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        try {
-            val out  = IntArray(w)
-            val rows = Array(3) { IntArray(w) }
-            source.getPixels(rows[0], 0, w, 0, 0, w, 1)
-            if (h > 1) source.getPixels(rows[1], 0, w, 0, 1, w, 1)
-            output.setPixels(rows[0], 0, w, 0, 0, w, 1)  // border row 0
-            for (y in 1 until h - 1) {
-                currentCoroutineContext().ensureActive()
-                source.getPixels(rows[2], 0, w, 0, y + 1, w, 1)
-                out[0] = rows[1][0]; out[w - 1] = rows[1][w - 1]
-                for (x in 1 until w - 1) {
-                    val p00 = rows[0][x-1] and 0xFF; val p01 = rows[0][x] and 0xFF; val p02 = rows[0][x+1] and 0xFF
-                    val p10 = rows[1][x-1] and 0xFF; val p11 = rows[1][x] and 0xFF; val p12 = rows[1][x+1] and 0xFF
-                    val p20 = rows[2][x-1] and 0xFF; val p21 = rows[2][x] and 0xFF; val p22 = rows[2][x+1] and 0xFF
-                    val v = ((p00 + 2*p01 + p02 + 2*p10 + 4*p11 + 2*p12 + p20 + 2*p21 + p22) / 16)
-                        .coerceIn(0, 255)
-                    out[x] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
-                }
-                output.setPixels(out, 0, w, 0, y, w, 1)
-                val tmp = rows[0]; rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = tmp
-            }
-            if (h > 1) output.setPixels(rows[1], 0, w, 0, h - 1, w, 1)
-            return output
-        } catch (e: Exception) { output.recycleIfNotRecycled(); throw e }
-    }
-
-    // =========================================================================
-    // V6 MỚI: SOBEL + OTSU AUTO-THRESHOLD
-    // =========================================================================
-
-    /**
-     * Sobel Edge Detection với Otsu's automatic threshold.
-     *
-     * Algorithm:
-     *   Pass 1: Tính gradient magnitude cho mọi pixel → lưu vào IntArray
-     *   Otsu:   Tìm threshold tối ưu từ magnitude histogram
-     *   Pass 2: Áp dụng threshold → smooth gray edges (gradient, không hard binary)
-     *
-     * Output format (cho BlendMode.Multiply):
-     *   • Pixel KHÔNG phải edge: 0x00000000 (transparent) → camera pass-through
-     *   • Pixel edge (mag ≥ threshold): ARGB(255, gray, gray, gray)
-     *       - gray = 200 khi mag = threshold (barely visible)
-     *       - gray = 0 khi mag = 255 (pitch black, strongest edge)
-     *   → Kết quả: cạnh mịn, anti-aliased tự nhiên
-     *
-     * @param otsuMultiplier: hệ số nhân với Otsu threshold
-     *   < 1.0 → ngưỡng thấp hơn Otsu → nhiều cạnh hơn
-     *   = 1.0 → dùng đúng Otsu (threshold=30)
-     *   > 1.0 → ngưỡng cao hơn Otsu → ít cạnh hơn, chọn lọc hơn
-     */
-    private suspend fun sobelWithOtsuToLineArt(
-        source: Bitmap,
-        otsuMultiplier: Float = 1.0f
-    ): Bitmap {
-        val w = source.width; val h = source.height
-        // Lưu toàn bộ magnitude để: (1) tính Otsu histogram, (2) apply threshold
-        // Memory: w×h × 4 bytes = ~8MB cho 1080p — chấp nhận được
-        val magnitudes = IntArray(w * h)
-        val output = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-
-        try {
-            // ================================================================
-            // PASS 1: Tính Sobel gradient magnitude — sliding 3-row window
-            // ================================================================
-            val rows = Array(3) { IntArray(w) }
-            source.getPixels(rows[0], 0, w, 0, 0, w, 1)
-            if (h > 1) source.getPixels(rows[1], 0, w, 0, 1, w, 1)
-            // Border pixels (row 0, row h-1, col 0, col w-1): magnitude = 0 (default)
-
-            for (y in 1 until h - 1) {
-                if (y % 50 == 0) currentCoroutineContext().ensureActive()
-                source.getPixels(rows[2], 0, w, 0, y + 1, w, 1)
-                val rowBase = y * w
-
-                for (x in 1 until w - 1) {
-                    val p00 = rows[0][x-1] and 0xFF; val p01 = rows[0][x] and 0xFF
-                    val p02 = rows[0][x+1] and 0xFF
-                    val p10 = rows[1][x-1] and 0xFF
-                    val p12 = rows[1][x+1] and 0xFF
-                    val p20 = rows[2][x-1] and 0xFF; val p21 = rows[2][x] and 0xFF
-                    val p22 = rows[2][x+1] and 0xFF
-
-                    // Sobel kernels
-                    val gx = -p00 - 2*p10 - p20 + p02 + 2*p12 + p22
-                    val gy = -p00 - 2*p01 - p02 + p20 + 2*p21 + p22
-
-                    // Normalized magnitude 0-255
-                    magnitudes[rowBase + x] = (
-                        sqrt(gx.toLong() * gx + gy.toLong() * gy.toDouble()) /
-                        SOBEL_MAG_MAX * 255
-                    ).toInt().coerceIn(0, 255)
-                }
-                val tmp = rows[0]; rows[0] = rows[1]; rows[1] = rows[2]; rows[2] = tmp
-            }
-
-            // ================================================================
-            // OTSU'S METHOD: Tìm optimal threshold từ magnitude histogram
-            // ================================================================
-            val rawOtsu = computeOtsuThreshold(magnitudes)
-            // Áp dụng otsuMultiplier từ slider:
-            // threshold=30 → multiplier=1.0 → dùng Otsu trực tiếp (optimal)
-            // threshold=0  → multiplier=0.1 → ngưỡng thấp → nhiều edge (sensitive)
-            // threshold=100→ multiplier=3.3 → ngưỡng cao → ít edge (selective)
-            val finalThreshold = (rawOtsu * otsuMultiplier).toInt().coerceIn(3, 250)
-
-            Log.d(TAG, "Otsu raw=$rawOtsu, multiplier=%.2f, final=$finalThreshold".format(otsuMultiplier))
-
-            // ================================================================
-            // PASS 2: Apply threshold → smooth gray output cho BlendMode.Multiply
-            // ================================================================
-            val outRow = IntArray(w)
-            val range = (255 - finalThreshold).toFloat().coerceAtLeast(1f)
-
-            for (y in 0 until h) {
-                if (y % 100 == 0) currentCoroutineContext().ensureActive()
-                val rowBase = y * w
-                for (x in 0 until w) {
-                    val mag = magnitudes[rowBase + x]
-                    if (mag > finalThreshold) {
-                        // EDGE PIXEL: smooth gradient từ barely-visible đến pitch-black
-                        // strength=0 → gray=200 (edge barely visible)
-                        // strength=1 → gray=0   (pitch black, strongest edge)
-                        val strength = ((mag - finalThreshold).toFloat() / range).coerceIn(0f, 1f)
-                        val gray = (200f * (1f - strength)).toInt().coerceIn(0, 200)
-
-                        // ARGB: alpha=255 (opaque), R=G=B=gray
-                        // Với BlendMode.Multiply:
-                        //   gray=200 → camera × 0.78 (barely darkened, subtle edge)
-                        //   gray=100 → camera × 0.39 (clearly darkened)
-                        //   gray=0   → camera × 0    (pure black, strongest line)
-                        outRow[x] = (0xFF shl 24) or (gray shl 16) or (gray shl 8) or gray
-                    } else {
-                        // BACKGROUND: transparent → camera pass-through với Multiply
-                        outRow[x] = 0x00000000
-                    }
-                }
-                output.setPixels(outRow, 0, w, 0, y, w, 1)
-            }
-
-            return output
-        } catch (e: Exception) {
-            output.recycleIfNotRecycled()
-            throw e
-        }
-    }
-
-    /**
-     * Otsu's Thresholding Algorithm
-     * Tìm threshold t tối đa hóa between-class variance:
-     *   σ²(t) = w₀(t)·w₁(t)·[μ₀(t) - μ₁(t)]²
-     *
-     * Input: mảng magnitude 0-255 (từ Sobel)
-     * Output: threshold tối ưu cho ảnh cụ thể này
-     *
-     * Không cần user tune — tự động adapt với mọi loại ảnh:
-     *   - Portrait (ít edge) → threshold thấp để bắt được cạnh mặt người
-     *   - Cityscape (nhiều edge) → threshold cao để lọc bớt
-     *   - Line art → threshold rất thấp (ảnh đã là đường nét)
-     */
-    private fun computeOtsuThreshold(magnitudes: IntArray): Int {
-        val histogram = IntArray(256)
-        for (mag in magnitudes) histogram[mag]++
-
-        val total = magnitudes.size.toLong()
-        // Tính tổng có trọng số: sum = Σ(t × count[t])
-        var sum = 0L
-        for (t in 1..255) sum += t.toLong() * histogram[t]
-
-        var sumB = 0L       // Tổng trọng số của class "background" (magnitude < t)
-        var wB   = 0L       // Số pixel class "background"
-        var maxVariance = 0.0
-        var threshold = 30  // Fallback mặc định nếu histogram quá phẳng
-
-        for (t in 0..255) {
-            wB += histogram[t]
-            if (wB == 0L) continue
-            val wF = total - wB  // Class "foreground" (edge pixels)
-            if (wF == 0L) break
-
-            sumB += t.toLong() * histogram[t]
-            val mB = sumB.toDouble() / wB        // Mean của background class
-            val mF = (sum - sumB).toDouble() / wF // Mean của foreground class
-
-            // Between-class variance: σ² = wB·wF·(mB-mF)²
-            val variance = wB.toDouble() * wF * (mB - mF) * (mB - mF)
-            if (variance > maxVariance) {
-                maxVariance = variance
-                threshold = t
-            }
-        }
-
-        // Nếu Otsu trả về 0 (histogram quá tập trung), dùng fallback
-        return threshold.coerceAtLeast(5)
     }
 }
