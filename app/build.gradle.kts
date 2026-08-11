@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.ardrawing"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 9
+        versionName = "1.9"
     }
 
     buildTypes {
@@ -36,14 +36,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
     kotlinOptions { jvmTarget = "17" }
-
     buildFeatures {
         compose = true
-        buildConfig = true   // Cần cho BuildConfig.DEBUG trong BitmapHandle
+        buildConfig = true
     }
-
     packaging {
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
@@ -58,7 +55,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.foundation:foundation")
-    implementation("androidx.compose.runtime:runtime-livedata")   // observeAsState
+    implementation("androidx.compose.runtime:runtime-livedata")
 
     // Core
     implementation("androidx.core:core-ktx:1.13.1")
@@ -76,14 +73,22 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraVer")
     implementation("androidx.camera:camera-view:$cameraVer")
 
-    // EXIF
+    // ExifInterface
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 
-    // Accompanist Permissions
+    // Accompanist
     implementation("com.google.accompanist:accompanist-permissions:0.34.0")
+
+    // =========================================================================
+    // V9 MỚI: ML Kit Selfie Segmentation
+    // Tự động detect & tách người khỏi nền (on-device, không cần internet)
+    // Model được bundled sẵn trong APK qua metadata trong AndroidManifest.xml
+    // =========================================================================
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")
