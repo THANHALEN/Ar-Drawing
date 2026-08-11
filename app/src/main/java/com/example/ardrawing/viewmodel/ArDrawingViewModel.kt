@@ -19,71 +19,88 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class ArDrawingViewModel : ViewModel() {
 
-    private val imageProcessor = ImageProcessor()
-    private val _uiState = MutableStateFlow(ArDrawingUiState())
+    private val imageProcessor   = ImageProcessor()
+    private val _uiState         = MutableStateFlow(ArDrawingUiState())
     val uiState: StateFlow<ArDrawingUiState> = _uiState.asStateFlow()
 
-    private var processingJob: Job? = null
-
-    // V5 FIX #3: Revision counter — latest-request-wins
+    private var processingJob    : Job? = null
     private val _requestRevision = AtomicInteger(0)
-    private var _activeHandle: BitmapHandle? = null
-    private var _bitmapRevision = 0
+    private var _activeHandle    : BitmapHandle? = null
+    private var _bitmapRevision  = 0
 
     fun loadAndProcessImage(contentResolver: ContentResolver, uri: Uri) {
+        _uiState.update { it.copy(savedUri = uri) }
+        processWithCurrentMode(contentResolver, uri)
+    }
+
+    fun toggleDisplayMode(contentResolver: ContentResolver) {
+        val newMode = if (_uiState.value.displayMode == DisplayMode.ORIGINAL)
+            DisplayMode.LINE_ART else DisplayMode.ORIGINAL
+        _uiState.update { it.copy(displayMode = newMode) }
+        _uiState.value.savedUri?.let { processWithCurrentMode(contentResolver, it) }
+    }
+
+    private fun processWithCurrentMode(contentResolver: ContentResolver, uri: Uri) {
         processingJob?.cancel()
         val myRevision = _requestRevision.incrementAndGet()
+        val mode = _uiState.value.displayMode
 
         processingJob = viewModelScope.launch {
             _uiState.update { it.copy(isProcessing = true, processingError = null) }
             try {
-                val newBitmap = imageProcessor.loadAndProcess(
-                    contentResolver = contentResolver,
-                    uri = uri,
-                    threshold = _uiState.value.edgeThreshold
-                )
-                // Kiểm tra: nếu user đã chọn ảnh khác → discard kết quả lỗi thời
+                val newBitmap = when (mode) {
+                    DisplayMode.ORIGINAL -> {
+                        Log.d(TAG, "Mode: ORIGINAL")
+                        imageProcessor.loadOriginal(contentResolver, uri)
+                    }
+                    DisplayMode.LINE_ART -> {
+                        Log.d(TAG, "Mode: LINE_ART (ML Kit + Color Dodge)")
+                        imageProcessor.loadAndProcess(
+                            contentResolver = contentResolver,
+                            uri             = uri,
+                            threshold       = _uiState.value.edgeThreshold
+                        )
+                    }
+                }
+
                 if (_requestRevision.get() != myRevision) {
                     newBitmap.recycleIfNotRecycled()
-                    Log.d(TAG, "Discard stale result rev=$myRevision")
                     return@launch
                 }
+
                 val newHandle = BitmapHandle(newBitmap)
                 val oldHandle = _activeHandle
-                _activeHandle = newHandle
+                _activeHandle    = newHandle
                 _bitmapRevision++
                 _uiState.update { it.copy(
                     bitmapHandle = newHandle,
                     bitmapId     = _bitmapRevision,
                     isProcessing = false,
-                    savedScale = 1f, savedRotation = 0f,
-                    savedOffsetX = 0f, savedOffsetY = 0f
+                    savedScale   = 1f, savedRotation = 0f,
+                    savedOffsetX = 0f, savedOffsetY  = 0f
                 ) }
                 oldHandle?.release()
 
             } catch (e: CancellationException) {
-                // V5 FIX #3: KHÔNG set state gì → job mới đã giữ isProcessing=true
-                Log.d(TAG, "Rev=$myRevision cancelled")
-                throw e  // Re-throw bắt buộc
-
+                _uiState.update { it.copy(isProcessing = false) }
+                throw e
             } catch (e: Exception) {
                 if (_requestRevision.get() == myRevision) {
-                    Log.e(TAG, "Error rev=$myRevision: ${e.message}", e)
+                    Log.e(TAG, "Error: ${e.message}", e)
                     _uiState.update { it.copy(
-                        isProcessing = false,
-                        processingError = "Không thể xử lý ảnh: ${e.localizedMessage}"
+                        isProcessing    = false,
+                        processingError = "Lỗi xử lý: ${e.localizedMessage}"
                     ) }
                 }
             }
         }
     }
 
-    fun updateOpacity(opacity: Float)  { _uiState.update { it.copy(opacity = opacity.coerceIn(0f,1f)) } }
-    fun toggleLock()                    { _uiState.update { it.copy(isLocked = !it.isLocked) } }
-    fun onCameraError(msg: String)      { _uiState.update { it.copy(cameraError = msg) } }
-    fun clearCameraError()              { _uiState.update { it.copy(cameraError = null) } }
-    fun clearError()                    { _uiState.update { it.copy(processingError = null) } }
-
+    fun updateOpacity(opacity: Float) { _uiState.update { it.copy(opacity = opacity.coerceIn(0f, 1f)) } }
+    fun toggleLock()                   { _uiState.update { it.copy(isLocked = !it.isLocked) } }
+    fun onCameraError(msg: String)     { _uiState.update { it.copy(cameraError = msg) } }
+    fun clearCameraError()             { _uiState.update { it.copy(cameraError = null) } }
+    fun clearError()                   { _uiState.update { it.copy(processingError = null) } }
     fun saveGestureTransform(scale: Float, rotation: Float, offsetX: Float, offsetY: Float) {
         _uiState.update { it.copy(
             savedScale = scale, savedRotation = rotation,
@@ -96,6 +113,9 @@ class ArDrawingViewModel : ViewModel() {
         processingJob?.cancel()
         _activeHandle?.release()
         _activeHandle = null
+        // V9 MỚI: đóng ML Kit segmenter để giải phóng resources
+        imageProcessor.close()
+        Log.d(TAG, "ViewModel cleared, ML Kit closed")
     }
 
     companion object { private const val TAG = "ArDrawingViewModel" }
